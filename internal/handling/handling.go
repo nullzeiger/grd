@@ -15,6 +15,7 @@ import (
 	"github.com/nullzeiger/grd/internal/client"
 	"github.com/nullzeiger/grd/internal/compare"
 	"github.com/nullzeiger/grd/internal/release"
+	"github.com/nullzeiger/grd/internal/remote"
 	"github.com/nullzeiger/grd/internal/storage"
 	"github.com/nullzeiger/grd/internal/version"
 )
@@ -170,6 +171,7 @@ func Download(ctx context.Context) error {
 	if len(errList) > 0 {
 		return fmt.Errorf("encountered %d errors during download", len(errList))
 	}
+
 	return nil
 }
 
@@ -180,5 +182,29 @@ func downloadAsset(ctx context.Context, rc *client.RequestClient, app App) error
 		return fmt.Errorf("download failed: %w", err)
 	}
 	fmt.Printf("Success! Saved to: %s\n\n", destPath)
+	return nil
+}
+
+func Remote(ctx context.Context, remoteFile string) error {
+	rc := client.New()
+
+	apps, err := remote.Read(ctx, rc, remoteFile)
+	if err != nil {
+		return err
+	}
+
+	var errList []error
+
+	for _, app := range apps {
+		if err := downloadAsset(ctx, rc, app); err != nil {
+			fmt.Fprintf(os.Stderr, "Error downloading %s: %v\n", app.Name, err)
+			errList = append(errList, err)
+		}
+	}
+
+	if len(errList) > 0 {
+		return fmt.Errorf("encountered %d errors during download", len(errList))
+	}
+
 	return nil
 }

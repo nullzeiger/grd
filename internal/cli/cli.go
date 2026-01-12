@@ -21,6 +21,7 @@ func Run() {
 	searchFlag := flag.String("search", "", "Search entries by keyword")
 	checkFlag := flag.Bool("check", false, "Check release applications")
 	downloadFlag := flag.Bool("download", false, "Download latest version applications")
+	remoteFlag := flag.String("remote", "", "Download applications using remote file")
 
 	name := flag.String("name", "", "Application name (required for -add)")
 	owner := flag.String("owner", "", "GitHub repository owner (required for -add)")
@@ -118,6 +119,16 @@ func Run() {
 		err := handling.Download(ctx)
 		if err != nil {
 			fmt.Println("Error during download:", err)
+		}
+		return
+	}
+
+	if *remoteFlag != "" {
+		ctx := context.Background()
+
+		err := handling.Remote(ctx, *remoteFlag)
+		if err != nil {
+			fmt.Println("Error during remote download:", err)
 		}
 		return
 	}

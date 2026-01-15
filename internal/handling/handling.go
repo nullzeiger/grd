@@ -9,7 +9,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"runtime"
 	"strings"
+	"sync"
 
 	"github.com/nullzeiger/grd/internal/app"
 	"github.com/nullzeiger/grd/internal/client"
@@ -43,7 +45,7 @@ func All() ([]string, error) {
 }
 
 func Create(newApp App) error {
-	if newApp.Name == "" || newApp.Owner == "" || newApp.Repo == "" {
+	if newApp.Name == "" || newApp.Owner == "" || newApp.Repo == "" || newApp.AssetPattern == "" || newApp.VersionFlag == "" {
 		return errors.New("invalid app data: missing required fields")
 	}
 	return storage.Append(newApp)
@@ -87,6 +89,14 @@ func Search(key string) ([]SearchResult, error) {
 	return results, nil
 }
 
+func concurrencyLevel() int {
+	n := runtime.NumCPU()
+	if n < 1 {
+		return 1
+	}
+	return n
+}
+
 func Check(ctx context.Context, download bool) error {
 	rc := client.New()
 
@@ -95,57 +105,80 @@ func Check(ctx context.Context, download bool) error {
 		return err
 	}
 
-	var errList []error
+	sem := make(chan struct{}, concurrencyLevel())
+	errChan := make(chan error, len(apps))
+	var wg sync.WaitGroup
 
-	for _, app := range apps {
-		err := func() error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	for _, a := range apps {
+		app := a
+		wg.Go(func() {
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				errChan <- ctx.Err()
+				return
+			}
+
 			local, err := version.Local(app.Name, app.VersionFlag)
 			if err != nil {
-				return fmt.Errorf("local version check failed: %w", err)
+				errChan <- fmt.Errorf("local version check failed: %w", err)
+				cancel()
+				return
 			}
 
 			latest, err := version.Latest(ctx, rc, app.Owner, app.Repo)
 			if err != nil {
-				return fmt.Errorf("github check failed: %w", err)
+				errChan <- fmt.Errorf("github check failed: %w", err)
+				cancel()
+				return
 			}
 
-			fmt.Printf("App: %s\n  Local: %s\n  Remote: %s\n  URL: %s\n",
+			fmt.Printf("App: %s\nLocal: %s Remote: %s URL: %s\n",
 				app.Name, local, latest.TagName, latest.URL)
 
 			comparator, err := compare.NewComparator()
 			if err != nil {
-				return err
+				errChan <- err
+				cancel()
+				return
 			}
 
 			result, err := comparator.CompareVersions(local, latest.TagName)
 			if err != nil {
-				return fmt.Errorf("comparison failed: %w", err)
+				errChan <- fmt.Errorf("comparison failed: %w", err)
+				cancel()
+				return
 			}
 
 			if result.IsLatest {
-				fmt.Printf("  Status: Up to date\n\n")
-				return nil
+				fmt.Printf("Status: Up to date\n\n")
+				return
 			}
 
-			fmt.Printf("  Status: Update available!\n")
+			fmt.Printf("Status: Update available!\n")
 			if download {
 				if err := downloadAsset(ctx, rc, app); err != nil {
-					return err
+					errChan <- err
+					cancel()
+					return
 				}
 			} else {
 				fmt.Println()
 			}
-			return nil
-		}()
-
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error processing %s: %v\n\n", app.Name, err)
-			errList = append(errList, err)
-		}
+		})
 	}
 
-	if len(errList) > 0 {
-		return fmt.Errorf("encountered %d errors during check", len(errList))
+	wg.Wait()
+	close(errChan)
+
+	for err := range errChan {
+		if err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -159,24 +192,47 @@ func Download(ctx context.Context) error {
 		return err
 	}
 
-	var errList []error
+	sem := make(chan struct{}, concurrencyLevel())
+	errChan := make(chan error, len(apps))
+	var wg sync.WaitGroup
 
-	for _, app := range apps {
-		if err := downloadAsset(ctx, rc, app); err != nil {
-			fmt.Fprintf(os.Stderr, "Error downloading %s: %v\n", app.Name, err)
-			errList = append(errList, err)
-		}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	for _, a := range apps {
+		app := a
+		wg.Go(func() {
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				errChan <- ctx.Err()
+				return
+			}
+
+			if err := downloadAsset(ctx, rc, app); err != nil {
+				fmt.Fprintf(os.Stderr, "Error downloading %s: %v\n", app.Name, err)
+				errChan <- err
+				cancel()
+				return
+			}
+		})
 	}
 
-	if len(errList) > 0 {
-		return fmt.Errorf("encountered %d errors during download", len(errList))
+	wg.Wait()
+	close(errChan)
+
+	for err := range errChan {
+		if err != nil {
+			return err
+		}
 	}
 
 	return nil
 }
 
 func downloadAsset(ctx context.Context, rc *client.RequestClient, app App) error {
-	fmt.Printf("Downloading latest release for %s...\n", app.Name)
+	fmt.Printf("Downloading latest release for %s... ", app.Name)
 	destPath, err := release.Latest(ctx, rc, app.Owner, app.Repo, app.AssetPattern)
 	if err != nil {
 		return fmt.Errorf("download failed: %w", err)
@@ -193,17 +249,40 @@ func Remote(ctx context.Context, remoteFile string) error {
 		return err
 	}
 
-	var errList []error
+	sem := make(chan struct{}, concurrencyLevel())
+	errChan := make(chan error, len(apps))
+	var wg sync.WaitGroup
 
-	for _, app := range apps {
-		if err := downloadAsset(ctx, rc, app); err != nil {
-			fmt.Fprintf(os.Stderr, "Error downloading %s: %v\n", app.Name, err)
-			errList = append(errList, err)
-		}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	for _, a := range apps {
+		app := a
+		wg.Go(func() {
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				errChan <- ctx.Err()
+				return
+			}
+
+			if err := downloadAsset(ctx, rc, app); err != nil {
+				fmt.Fprintf(os.Stderr, "Error downloading %s: %v\n", app.Name, err)
+				errChan <- err
+				cancel()
+				return
+			}
+		})
 	}
 
-	if len(errList) > 0 {
-		return fmt.Errorf("encountered %d errors during download", len(errList))
+	wg.Wait()
+	close(errChan)
+
+	for err := range errChan {
+		if err != nil {
+			return err
+		}
 	}
 
 	return nil

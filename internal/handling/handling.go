@@ -29,6 +29,8 @@ type SearchResult struct {
 	App   App
 }
 
+var outputMu sync.Mutex
+
 func All() ([]string, error) {
 	apps, err := storage.Read()
 	if err != nil {
@@ -97,6 +99,56 @@ func concurrencyLevel() int {
 	return n
 }
 
+func runParallel(ctx context.Context, apps []App, task func(context.Context, App) error) error {
+	sem := make(chan struct{}, concurrencyLevel())
+	errChan := make(chan error, 1)
+	var wg sync.WaitGroup
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	for _, a := range apps {
+		app := a
+
+		select {
+		case <-ctx.Done():
+			break
+		default:
+		}
+
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			break
+		}
+
+		wg.Go(func() {
+			defer func() { <-sem }()
+
+			if ctx.Err() != nil {
+				return
+			}
+
+			if err := task(ctx, app); err != nil {
+				select {
+				case errChan <- err:
+					cancel()
+				default:
+				}
+			}
+		})
+	}
+
+	wg.Wait()
+	close(errChan)
+
+	if err := <-errChan; err != nil {
+		return err
+	}
+
+	return nil
+}
+
 func Check(ctx context.Context, download bool) error {
 	rc := client.New()
 
@@ -105,83 +157,47 @@ func Check(ctx context.Context, download bool) error {
 		return err
 	}
 
-	sem := make(chan struct{}, concurrencyLevel())
-	errChan := make(chan error, len(apps))
-	var wg sync.WaitGroup
+	return runParallel(ctx, apps, func(ctx context.Context, app App) error {
+		local, err := version.Local(app.Name, app.VersionFlag)
+		if err != nil {
+			return fmt.Errorf("local version check failed for %s: %w", app.Name, err)
+		}
 
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+		latest, err := version.Latest(ctx, rc, app.Owner, app.Repo)
+		if err != nil {
+			return fmt.Errorf("github check failed for %s: %w", app.Name, err)
+		}
 
-	for _, a := range apps {
-		app := a
-		wg.Go(func() {
-			select {
-			case sem <- struct{}{}:
-				defer func() { <-sem }()
-			case <-ctx.Done():
-				errChan <- ctx.Err()
-				return
-			}
-
-			local, err := version.Local(app.Name, app.VersionFlag)
-			if err != nil {
-				errChan <- fmt.Errorf("local version check failed: %w", err)
-				cancel()
-				return
-			}
-
-			latest, err := version.Latest(ctx, rc, app.Owner, app.Repo)
-			if err != nil {
-				errChan <- fmt.Errorf("github check failed: %w", err)
-				cancel()
-				return
-			}
-
-			fmt.Printf("App: %s\nLocal: %s Remote: %s URL: %s\n",
-				app.Name, local, latest.TagName, latest.URL)
-
-			comparator, err := compare.NewComparator()
-			if err != nil {
-				errChan <- err
-				cancel()
-				return
-			}
-
-			result, err := comparator.CompareVersions(local, latest.TagName)
-			if err != nil {
-				errChan <- fmt.Errorf("comparison failed: %w", err)
-				cancel()
-				return
-			}
-
-			if result.IsLatest {
-				fmt.Printf("Status: Up to date\n\n")
-				return
-			}
-
-			fmt.Printf("Status: Update available!\n")
-			if download {
-				if err := downloadAsset(ctx, rc, app); err != nil {
-					errChan <- err
-					cancel()
-					return
-				}
-			} else {
-				fmt.Println()
-			}
-		})
-	}
-
-	wg.Wait()
-	close(errChan)
-
-	for err := range errChan {
+		comparator, err := compare.NewComparator()
 		if err != nil {
 			return err
 		}
-	}
 
-	return nil
+		result, err := comparator.CompareVersions(local, latest.TagName)
+		if err != nil {
+			return fmt.Errorf("comparison failed for %s: %w", app.Name, err)
+		}
+
+		outputMu.Lock()
+		fmt.Printf("App: %s\nLocal: %s Remote: %s URL: %s\n",
+			app.Name, local, latest.TagName, latest.URL)
+
+		if result.IsLatest {
+			fmt.Printf("Status: Up to date\n\n")
+			outputMu.Unlock()
+			return nil
+		}
+
+		fmt.Printf("Status: Update available!\n")
+		if !download {
+			fmt.Println()
+			outputMu.Unlock()
+			return nil
+		}
+		outputMu.Unlock()
+
+		return downloadAssetSafe(ctx, rc, app)
+	})
 }
 
 func Download(ctx context.Context) error {
@@ -192,53 +208,15 @@ func Download(ctx context.Context) error {
 		return err
 	}
 
-	sem := make(chan struct{}, concurrencyLevel())
-	errChan := make(chan error, len(apps))
-	var wg sync.WaitGroup
-
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	for _, a := range apps {
-		app := a
-		wg.Go(func() {
-			select {
-			case sem <- struct{}{}:
-				defer func() { <-sem }()
-			case <-ctx.Done():
-				errChan <- ctx.Err()
-				return
-			}
-
-			if err := downloadAsset(ctx, rc, app); err != nil {
-				fmt.Fprintf(os.Stderr, "Error downloading %s: %v\n", app.Name, err)
-				errChan <- err
-				cancel()
-				return
-			}
-		})
-	}
-
-	wg.Wait()
-	close(errChan)
-
-	for err := range errChan {
-		if err != nil {
+	return runParallel(ctx, apps, func(ctx context.Context, app App) error {
+		if err := downloadAssetSafe(ctx, rc, app); err != nil {
+			outputMu.Lock()
+			fmt.Fprintf(os.Stderr, "Error downloading %s: %v\n", app.Name, err)
+			outputMu.Unlock()
 			return err
 		}
-	}
-
-	return nil
-}
-
-func downloadAsset(ctx context.Context, rc *client.RequestClient, app App) error {
-	fmt.Printf("Downloading latest release for %s... ", app.Name)
-	destPath, err := release.Latest(ctx, rc, app.Owner, app.Repo, app.AssetPattern)
-	if err != nil {
-		return fmt.Errorf("download failed: %w", err)
-	}
-	fmt.Printf("Success! Saved to: %s\n\n", destPath)
-	return nil
+		return nil
+	})
 }
 
 func Remote(ctx context.Context, remoteFile string) error {
@@ -249,41 +227,31 @@ func Remote(ctx context.Context, remoteFile string) error {
 		return err
 	}
 
-	sem := make(chan struct{}, concurrencyLevel())
-	errChan := make(chan error, len(apps))
-	var wg sync.WaitGroup
-
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	for _, a := range apps {
-		app := a
-		wg.Go(func() {
-			select {
-			case sem <- struct{}{}:
-				defer func() { <-sem }()
-			case <-ctx.Done():
-				errChan <- ctx.Err()
-				return
-			}
-
-			if err := downloadAsset(ctx, rc, app); err != nil {
-				fmt.Fprintf(os.Stderr, "Error downloading %s: %v\n", app.Name, err)
-				errChan <- err
-				cancel()
-				return
-			}
-		})
-	}
-
-	wg.Wait()
-	close(errChan)
-
-	for err := range errChan {
-		if err != nil {
+	return runParallel(ctx, apps, func(ctx context.Context, app App) error {
+		if err := downloadAssetSafe(ctx, rc, app); err != nil {
+			outputMu.Lock()
+			fmt.Fprintf(os.Stderr, "Error downloading %s: %v\n", app.Name, err)
+			outputMu.Unlock()
 			return err
 		}
-	}
+		return nil
+	})
+}
 
+func downloadAssetSafe(ctx context.Context, rc *client.RequestClient, app App) error {
+	outputMu.Lock()
+	fmt.Printf("Downloading latest release for %s... ", app.Name)
+	outputMu.Unlock()
+
+	destPath, err := release.Latest(ctx, rc, app.Owner, app.Repo, app.AssetPattern)
+
+	outputMu.Lock()
+	defer outputMu.Unlock()
+
+	if err != nil {
+		fmt.Printf("Failed!\n")
+		return fmt.Errorf("download failed: %w", err)
+	}
+	fmt.Printf("Success! Saved to: %s\n\n", destPath)
 	return nil
 }

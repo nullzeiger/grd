@@ -161,8 +161,6 @@ func Check(ctx context.Context, download bool) error {
 	}
 
 	return runParallel(ctx, apps, func(ctx context.Context, app App) error {
-		// --- 1. FASE DI ELABORAZIONE (Nessun Lock) ---
-		// Recuperiamo i dati in parallelo senza bloccare nessuno
 		local, err := version.Local(app.Name, app.VersionFlag)
 		if err != nil {
 			return fmt.Errorf("local version check failed for %s: %w", app.Name, err)
@@ -183,9 +181,6 @@ func Check(ctx context.Context, download bool) error {
 			return fmt.Errorf("comparison failed for %s: %w", app.Name, err)
 		}
 
-		// --- 2. FASE DI PREPARAZIONE OUTPUT (Nessun Lock) ---
-		// Usiamo strings.Builder per costruire il messaggio in memoria.
-		// È molto più efficiente di fmt.Sprintf per messaggi composti.
 		var out strings.Builder
 		out.WriteString(fmt.Sprintf("App: %-15s | Local: %-10s | Remote: %-10s\n",
 			app.Name, local, latest.TagName))
@@ -197,14 +192,11 @@ func Check(ctx context.Context, download bool) error {
 		}
 		out.WriteString("--------------------------------------------------\n")
 
-		// --- 3. FASE DI STAMPA (Un solo Lock brevissimo) ---
 		outputMu.Lock()
 		fmt.Print(out.String())
 		outputMu.Unlock()
 
-		// --- 4. GESTIONE DOWNLOAD ---
 		if !result.IsLatest && download {
-			// downloadAssetSafe ha già i suoi lock interni, quindi la chiamiamo normalmente.
 			return downloadAssetSafe(ctx, rc, app)
 		}
 
@@ -251,10 +243,8 @@ func Remote(ctx context.Context, remoteFile string) error {
 }
 
 func downloadAssetSafe(ctx context.Context, rc *client.RequestClient, app App) error {
-	// 1. Lavoro pesante senza lock
 	destPath, err := release.Latest(ctx, rc, app.Owner, app.Repo, app.AssetPattern)
 
-	// 2. Un unico lock breve per il responso finale
 	outputMu.Lock()
 	defer outputMu.Unlock()
 

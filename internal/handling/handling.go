@@ -99,51 +99,55 @@ func concurrencyLevel() int {
 	return n
 }
 
-func runParallel(ctx context.Context, apps []App, task func(context.Context, App) error) error {
+func runParallel(
+	ctx context.Context,
+	apps []App,
+	task func(context.Context, App) error,
+) error {
 	sem := make(chan struct{}, concurrencyLevel())
-	errChan := make(chan error, 1)
 	var wg sync.WaitGroup
 
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	errChan := make(chan error, len(apps))
 
-	for _, a := range apps {
-		app := a
-
-		select {
-		case <-ctx.Done():
+	for _, app := range apps {
+		if ctx.Err() != nil {
 			break
-		default:
 		}
 
 		select {
 		case sem <- struct{}{}:
+			wg.Go(func() {
+				defer func() {
+					<-sem
+					if r := recover(); r != nil {
+						errChan <- fmt.Errorf("panic in %s: %v", app.Name, r)
+					}
+				}()
+
+				if err := task(ctx, app); err != nil {
+					errChan <- err
+				}
+			})
+
 		case <-ctx.Done():
-			break
 		}
 
-		wg.Go(func() {
-			defer func() { <-sem }()
-
-			if ctx.Err() != nil {
-				return
-			}
-
-			if err := task(ctx, app); err != nil {
-				select {
-				case errChan <- err:
-					cancel()
-				default:
-				}
-			}
-		})
+		if ctx.Err() != nil {
+			break
+		}
 	}
 
 	wg.Wait()
+
 	close(errChan)
 
-	if err := <-errChan; err != nil {
-		return err
+	var errs []error
+	for err := range errChan {
+		errs = append(errs, err)
+	}
+
+	if len(errs) > 0 {
+		return errors.Join(errs...)
 	}
 
 	return nil
@@ -151,13 +155,14 @@ func runParallel(ctx context.Context, apps []App, task func(context.Context, App
 
 func Check(ctx context.Context, download bool) error {
 	rc := client.New()
-
 	apps, err := storage.Read()
 	if err != nil {
 		return err
 	}
 
 	return runParallel(ctx, apps, func(ctx context.Context, app App) error {
+		// --- 1. FASE DI ELABORAZIONE (Nessun Lock) ---
+		// Recuperiamo i dati in parallelo senza bloccare nessuno
 		local, err := version.Local(app.Name, app.VersionFlag)
 		if err != nil {
 			return fmt.Errorf("local version check failed for %s: %w", app.Name, err)
@@ -178,25 +183,32 @@ func Check(ctx context.Context, download bool) error {
 			return fmt.Errorf("comparison failed for %s: %w", app.Name, err)
 		}
 
-		outputMu.Lock()
-		fmt.Printf("App: %s\nLocal: %s Remote: %s URL: %s\n",
-			app.Name, local, latest.TagName, latest.URL)
+		// --- 2. FASE DI PREPARAZIONE OUTPUT (Nessun Lock) ---
+		// Usiamo strings.Builder per costruire il messaggio in memoria.
+		// È molto più efficiente di fmt.Sprintf per messaggi composti.
+		var out strings.Builder
+		out.WriteString(fmt.Sprintf("App: %-15s | Local: %-10s | Remote: %-10s\n",
+			app.Name, local, latest.TagName))
 
 		if result.IsLatest {
-			fmt.Printf("Status: Up to date\n\n")
-			outputMu.Unlock()
-			return nil
+			out.WriteString("Status: [✓] Up to date\n")
+		} else {
+			out.WriteString("Status: [!] Update available!\n")
 		}
+		out.WriteString("--------------------------------------------------\n")
 
-		fmt.Printf("Status: Update available!\n")
-		if !download {
-			fmt.Println()
-			outputMu.Unlock()
-			return nil
-		}
+		// --- 3. FASE DI STAMPA (Un solo Lock brevissimo) ---
+		outputMu.Lock()
+		fmt.Print(out.String())
 		outputMu.Unlock()
 
-		return downloadAssetSafe(ctx, rc, app)
+		// --- 4. GESTIONE DOWNLOAD ---
+		if !result.IsLatest && download {
+			// downloadAssetSafe ha già i suoi lock interni, quindi la chiamiamo normalmente.
+			return downloadAssetSafe(ctx, rc, app)
+		}
+
+		return nil
 	})
 }
 
@@ -239,19 +251,17 @@ func Remote(ctx context.Context, remoteFile string) error {
 }
 
 func downloadAssetSafe(ctx context.Context, rc *client.RequestClient, app App) error {
-	outputMu.Lock()
-	fmt.Printf("Downloading latest release for %s... ", app.Name)
-	outputMu.Unlock()
-
+	// 1. Lavoro pesante senza lock
 	destPath, err := release.Latest(ctx, rc, app.Owner, app.Repo, app.AssetPattern)
 
+	// 2. Un unico lock breve per il responso finale
 	outputMu.Lock()
 	defer outputMu.Unlock()
 
 	if err != nil {
-		fmt.Printf("Failed!\n")
-		return fmt.Errorf("download failed: %w", err)
+		fmt.Printf("[!] %s: Failed\n", app.Name)
+		return err
 	}
-	fmt.Printf("Success! Saved to: %s\n\n", destPath)
+	fmt.Printf("[✓] %s: Saved to %s\n", app.Name, destPath)
 	return nil
 }
